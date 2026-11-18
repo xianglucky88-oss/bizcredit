@@ -1,9 +1,9 @@
-
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import hashlib
 import json
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from bizcredit.config import SPEC
 from bizcredit.mockdata import build_rows, extra_row
 
@@ -12,6 +12,12 @@ _ALL = build_rows()
 _extra = []
 _verified_sessions = set()
 _accepted_tokens = set()
+# Per-token injected portal behaviour for offline failure/recovery exercises:
+#   "reject"         -> definitive 422 refusal, no record created
+#   "timeout_before" -> 504, request never produced a record
+#   "timeout_after"  -> record created, then 504 (confirmation lost)
+#   "drop_after"     -> record created, then the connection drops
+_submit_behavior = {}
 
 def _data():
     return _ALL + _extra
@@ -86,7 +92,49 @@ async def captcha(request: Request):
 async def submit(request: Request):
     body = await request.json()
     token = body.get("token")
+    behavior = _submit_behavior.pop(token, None)  # one-shot; later calls run normally
+    if behavior == "reject":
+        return JSONResponse(
+            status_code=422,
+            content={"created": False, "token": token,
+                     "reason": "rejected by portal rule"})
+    if behavior == "timeout_before":
+        return Response(status_code=504)
+    if behavior in ("timeout_after", "drop_after"):
+        _accepted_tokens.add(token)
+        if behavior == "drop_after":
+            # Simulate the connection vanishing before the client gets a response.
+            raise RuntimeError("simulated connection drop after record creation")
+        return Response(status_code=504)
     created = token not in _accepted_tokens
     if created:
         _accepted_tokens.add(token)
     return {"created": bool(created), "token": token}
+
+
+@app.get("/submissions/{token}")
+def submission_lookup(token: str):
+    """Idempotency reconciliation: report whether the portal holds the record."""
+    if token in _accepted_tokens:
+        return {"token": token, "state": "accepted"}
+    return JSONResponse(status_code=404,
+                        content={"token": token, "state": "missing"})
+
+
+@app.post("/test/reset")
+def test_reset():
+    """Clear portal-side state and injected failure modes (test hook)."""
+    _extra.clear()
+    _verified_sessions.clear()
+    _accepted_tokens.clear()
+    _submit_behavior.clear()
+    app.__dict__["_flaky_n"] = 0
+    return {"ok": True}
+
+
+@app.post("/test/fail_submit")
+async def test_fail_submit(request: Request):
+    """Inject a one-shot failure mode for a token (test hook)."""
+    body = await request.json()
+    _submit_behavior[body["token"]] = body["behavior"]
+    return {"ok": True, "token": body["token"], "behavior": body["behavior"]}
